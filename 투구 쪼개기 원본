@@ -1,0 +1,199 @@
+// 매크로를 실행할 때 전달된 인수에서 필요한 데이터를 가져오기
+let { actor: currentActor, item: currentItem } = args[0] ?? {};
+
+// 유효성 검사
+if (!currentActor || !currentItem) {
+    ui.notifications.error("아이템 또는 배우를 찾을 수 없습니다.");
+    return;
+}
+
+// 특기 사용에 필요한 MP 확인
+let requiredMP = 4;  // 특기 사용에 필요한 MP
+let currentMP = getProperty(currentActor.system, "mana.value") || 0;
+
+if (currentMP < requiredMP) {
+    ui.notifications.error("MP가 부족하여 특기를 사용할 수 없습니다.");
+    return;
+}
+
+// 대상 선택 확인
+let targets = game.user.targets;
+if (targets.size !== 1) {
+    ui.notifications.error("이 특기는 단일 대상을 대상으로 해야 합니다.");
+    return;
+}
+
+let targetToken = targets.values().next().value; // 선택된 단일 대상
+let targetActor = targetToken.actor;
+
+// 대상의 회피(evasion) 값을 난이도로 설정
+let targetEvasion = parseInt(getProperty(targetActor.system, "checks.evasion")) || 0;
+let difficulty = targetEvasion;
+
+// 스킬 랭크 (SR) 가져오기
+let skillRank = getProperty(currentItem.system, "skillRank.value") || 1;
+
+// 현재 캐릭터의 힘(str) 값 가져오기
+let strength = getProperty(currentActor.system, "attributes.derived.str.value") || 0;
+
+// 현재 캐릭터의 물리 명중치 (accuracy) 정보 가져오기
+let accuracyTotal = getProperty(currentActor.system, "checks.accuracy.total") || 0;
+let accuracyRank = getProperty(currentActor.system, "checks.accuracy.rank") || 0;
+let accuracyAttain = getProperty(currentActor.system, "checks.accuracy.attain") || 0;
+
+// 다이얼로그를 통해 주사위 개수를 물어봅니다
+const renderedDialog = await renderTemplate(
+    "systems/lhtrpgbrew/templates/dialogs/rollDialog.html"
+);
+
+const dialogTitle = "판정 주사위 선택";
+
+new Dialog({
+    title: dialogTitle,
+    content: renderedDialog,
+    buttons: {
+        roll: {
+            icon: '<i class="fas fa-dice"></i>',
+            label: "주사위 굴리기",
+            callback: async (html) => {
+                const dices = parseInt(html.find(".abilityCheckDiceNumber").val()) || 2; // 기본 2d6
+
+                // 주사위 굴리기
+                let rollFormula = `${dices}d6`;
+                let roll = await new Roll(rollFormula).evaluate();
+                let rollTotal = roll.total;
+                let individualResults = roll.dice[0].results.map((r) => r.result);
+
+                // 판정값 계산
+                let difficultyTotal = accuracyTotal - difficulty + accuracyRank;
+                let attainTotal = rollTotal + accuracyRank + accuracyAttain;
+
+                let success = rollTotal <= difficultyTotal;
+                let additionalFlavor;
+
+                if (success) {
+                    additionalFlavor = `<h3 style="text-align:center; color:green;">성공</h3><div style="text-align:center; font-size: 20px;">달성치 : ${attainTotal}</div>`;
+
+                    // 헤이트 2 증가 및 MP 4 소모
+                    let currentHate = getProperty(currentActor.system, "infos.hate") || 0;
+                    await currentActor.update({"system.infos.hate": currentHate + 2});
+
+                    await currentActor.update({"system.mana.value": currentMP - requiredMP});
+
+                    let resourceMessage = `${currentActor.name}이(가) 특기를 사용하여 헤이트가 2 증가하고 MP가 4 소모되었습니다. 현재 MP: ${currentMP - requiredMP}`;
+                    ui.notifications.info(resourceMessage);
+
+                    // 피해 계산 시작
+                    let damageRoll = new Roll(`${skillRank + 2}d6 + ${strength}`).evaluate({ async: false });
+                    let initialDamage = damageRoll.total;
+
+                    // 피해 계산 로그 생성
+                    let damageLog = [`<h3>피해 계산</h3>`];
+                    damageLog.push(`초기 피해: ${initialDamage}`);
+
+                    // 대상의 HP가 최대 HP와 같으면 추가 대미지 적용
+                    let targetHP = getProperty(targetActor.system, "health.value") || 0;
+                    let targetMaxHP = getProperty(targetActor.system, "health.max") || 0;
+                    if (targetHP === targetMaxHP) {
+                        initialDamage += strength;
+                        damageLog.push(`대상의 HP가 최대치이므로 추가 피해(${strength})가 적용되었습니다.`);
+                    }
+
+                    // 실드 처리
+                    let shield = getProperty(targetActor.system, "combat-status.shield") || 0;
+                    let shieldDamage = 0;
+                    if (shield > 0) {
+                        shieldDamage = Math.min(shield, initialDamage);
+                        initialDamage -= shieldDamage;
+                        shield -= shieldDamage;
+
+                        // 실드 업데이트
+                        await targetActor.update({"system.combat-status.shield": shield});
+                        damageLog.push(`실드로 ${shieldDamage}만큼의 피해가 차감되었습니다. 남은 실드: ${shield}`);
+                    }
+
+                    // 피해 경감 확인
+                    let damageReduction = getProperty(targetActor.system, "combat-status.damageReduction") || [];
+                    let highestReduction = 0;
+
+                    for (let reduction of damageReduction) {
+                        if (reduction.type === "physical" || reduction.type === "all") {
+                            highestReduction = Math.max(highestReduction, reduction.value);
+                        }
+                    }
+
+                    if (highestReduction > 0) {
+                        initialDamage = Math.max(initialDamage - highestReduction, 0);
+                        damageLog.push(`경감(${highestReduction})에 의해 피해가 차감되었습니다.`);
+                    }
+
+                    // 물리 방어력 적용
+                    let physicalDefense = getProperty(targetActor.system, "battle-status.defense.phys") || 0;
+                    let finalDamage = Math.max(initialDamage - physicalDefense, 0);
+                    damageLog.push(`물리 방어력(${physicalDefense})에 의해 피해가 차감되었습니다.`);
+
+                    // 추가타 확인 및 처리
+                    let additionalHit = getProperty(targetActor.system, "bad-status.additionalHit") || [];
+                    if (additionalHit.length > 0) {
+                        let highestAdditionalHit = Math.max(...additionalHit);
+                        finalDamage += highestAdditionalHit;
+                        damageLog.push(`추가타(${highestAdditionalHit})가 적용되었습니다.`);
+
+                        // 추가타를 배열에서 제거
+                        additionalHit = additionalHit.filter(hit => hit !== highestAdditionalHit);
+                        await targetActor.update({"system.bad-status.additionalHit": additionalHit});
+                    }
+
+                    // 최종 피해 적용
+                    let newHP = Math.max(targetHP - finalDamage, 0);
+                    await targetActor.update({"system.health.value": newHP});
+
+                    // 최종 결과 메시지 생성
+                    damageLog.push(`최종 피해: ${finalDamage}`);
+                    damageLog.push(`${targetActor.name}이(가) ${finalDamage}의 물리 대미지를 받았습니다. 현재 HP: ${newHP}/${targetMaxHP}`);
+                    ui.notifications.info(`${targetActor.name}이(가) ${finalDamage}의 물리 대미지를 받았습니다.`);
+
+                    // 판정 결과를 채팅에 출력
+                    let content = `
+                    <h2>판정 결과</h2>
+                    <h3 style="text-align:center; background-color: #ababab;">주사위 결과</h3>
+                    <div style="text-align:center; font-size: 20px;">${individualResults.join(", ")}</div>
+                    <h3 style="text-align:center; background-color: #ababab;">판정값 vs 난이도</h3>
+                    <div style="text-align:center; font-size: 20px;">${rollTotal} vs ${difficultyTotal}</div>${additionalFlavor}
+                    <br>${resourceMessage}<br>${damageLog.join("<br>")}`;
+
+                    // 채팅 메시지 출력
+                    ChatMessage.create({
+                        content: content,
+                        speaker: ChatMessage.getSpeaker({ actor: currentActor }),
+                    });
+
+                } else {
+                    additionalFlavor = `<h3 style="text-align:center; color:red;">실패</h3>`;
+
+                    // 실패한 경우에도 리소스 메시지를 출력
+                    let resourceMessage = `${currentActor.name}이(가) 특기를 사용하여 헤이트가 2 증가하고 MP가 4 소모되었습니다. 현재 MP: ${currentMP - requiredMP}`;
+                    ui.notifications.info(resourceMessage);
+
+                    let content = `
+                    <h2>판정 결과</h2>
+                    <h3 style="text-align:center; background-color: #ababab;">주사위 결과</h3>
+                    <div style="text-align:center; font-size: 20px;">${individualResults.join(", ")}</div>
+                    <h3 style="text-align:center; background-color: #ababab;">판정값 vs 난이도</h3>
+                    <div style="text-align:center; font-size: 20px;">${rollTotal} vs ${difficultyTotal}</div>${additionalFlavor}
+                    <br>${resourceMessage}`;
+
+                    ChatMessage.create({
+                        content: content,
+                        speaker: ChatMessage.getSpeaker({ actor: currentActor }),
+                    });
+                }
+            }
+        },
+        cancel: {
+            icon: '<i class="fas fa-times"></i>',
+            label: "취소"
+        }
+    },
+    default: "roll"
+}).render(true);
